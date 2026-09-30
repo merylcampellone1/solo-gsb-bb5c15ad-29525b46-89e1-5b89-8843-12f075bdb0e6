@@ -1,0 +1,8 @@
+fastapi==0.142.1
+uvicorn[standard]==0.54.0
+psycopg[binary]==3.3.6
+psycopg-pool==3.3.3
+pydantic==2.13.5
+# IANA database for slim images that ship without system tzdata; ignored when
+# /usr/share/zoneinfo is present.
+tzdata==2025.3
