@@ -128,6 +128,33 @@ class WaitlistTokenIn(BaseModel):
     query_token: str | None = None
 
 
+class ReservationReassignIn(BaseModel):
+    """Reassign (改派) request: move a visit to another recycling point.
+
+    ``idempotency_key`` is scoped to the source reservation (independent of
+    the creation and reschedule keys) and makes retrying the same reassign
+    attempt safe.  ``target_point_id`` must name a different point than the
+    one in the path.
+    """
+
+    cancel_token: str | None = None
+    expected_revision: int = Field(ge=1)
+    idempotency_key: str = Field(min_length=1, max_length=200)
+    target_point_id: int = Field(ge=1)
+    start: datetime
+    end: datetime
+
+    @field_validator("start", "end")
+    @classmethod
+    def _must_be_timezone_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(
+                "must be an ISO-8601 timestamp with an explicit UTC offset "
+                "(e.g. 2026-10-01T09:00:00Z)"
+            )
+        return value
+
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
@@ -365,3 +392,17 @@ class WaitlistOut(BaseModel):
     query_token: str
     created_at: datetime
     reservation: ReservationOut | None = None
+
+
+class ReassignOut(BaseModel):
+    """Result of a cross-point reassignment (改派).
+
+    ``source_reservation`` is the original reservation after cancellation;
+    ``target_reservation`` is the newly booked reservation at the target
+    point (new number, new cancel token, revision 1, validated against
+    ``target_rules_version``).
+    """
+
+    source_reservation: ReservationStateOut
+    target_reservation: ReservationOut
+    target_rules_version: int

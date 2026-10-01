@@ -104,6 +104,13 @@ class ReservationNotReschedulableError(ApiError):
     code = "reservation_not_reschedulable"
 
 
+class InvalidRequestError(ApiError):
+    """The request is structurally valid JSON but semantically unacceptable."""
+
+    status_code = 422
+    code = "invalid_request"
+
+
 # ---------------------------------------------------------------------------
 # Waitlist (候补)
 # ---------------------------------------------------------------------------

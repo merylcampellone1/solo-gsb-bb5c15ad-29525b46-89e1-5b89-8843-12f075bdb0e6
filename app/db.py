@@ -496,6 +496,62 @@ def cancel_reservation(
     return row, True
 
 
+# ---------------------------------------------------------------------------
+# Reassignments (改派) — move a visit to another point in one transaction
+# ---------------------------------------------------------------------------
+
+_REASSIGN_COLS = (
+    "id, reservation_id, source_point_id, target_point_id, idempotency_key, "
+    "expected_revision, start_utc, end_utc, target_reservation_id, "
+    "target_rules_version, created_at"
+)
+
+
+def get_reassign_by_key(
+    cur: psycopg.Cursor, reservation_id: int, idempotency_key: str
+) -> dict | None:
+    return cur.execute(
+        f"SELECT {_REASSIGN_COLS} FROM reservation_reassigns "
+        "WHERE reservation_id = %s AND idempotency_key = %s",
+        (reservation_id, idempotency_key),
+    ).fetchone()
+
+
+def insert_reassign(
+    cur: psycopg.Cursor,
+    *,
+    reservation_id: int,
+    source_point_id: int,
+    target_point_id: int,
+    idempotency_key: str,
+    expected_revision: int,
+    start_utc: datetime,
+    end_utc: datetime,
+    target_reservation_id: int,
+    target_rules_version: int,
+) -> dict:
+    """Record one successful cross-point reassignment attempt."""
+    return cur.execute(
+        "INSERT INTO reservation_reassigns "
+        "(reservation_id, source_point_id, target_point_id, idempotency_key, "
+        " expected_revision, start_utc, end_utc, target_reservation_id, "
+        " target_rules_version) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+        f"RETURNING {_REASSIGN_COLS}",
+        (
+            reservation_id,
+            source_point_id,
+            target_point_id,
+            idempotency_key,
+            expected_revision,
+            start_utc,
+            end_utc,
+            target_reservation_id,
+            target_rules_version,
+        ),
+    ).fetchone()
+
+
 def assert_reservations_fit(
     cur: psycopg.Cursor, point_id: int, timezone_name: str, payload: dict
 ) -> None:

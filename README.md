@@ -2,7 +2,8 @@
 
 为社区回收点维护**每周开放时段**、**指定日期全天停开**与**当日补开时段**，
 按当地日期范围查询，逐日返回**实际开放区间的 UTC 起止、当地日期和来源**；
-并支持以当前已发布日历为准的**到访预约**（幂等创建、凭证取消、变更保护）。
+并支持以当前已发布日历为准的**到访预约**（幂等创建、凭证取消、变更保护、
+凭凭证改期、占用窗口候补与释放转正、跨点**改派**）。
 
 技术栈：Python 3.11 · FastAPI · PostgreSQL 16 · psycopg 3 · Uvicorn。
 
@@ -118,6 +119,21 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   - **原创建幂等键不受改期影响**：创建键的同内容重试始终以**首次创建**的
     起止与凭证为准（响应中的窗口/规则版本/修订号 `1` 即首次创建快照，状态
     字段反映当前状态），异内容仍报 `idempotency_conflict`。
+  - **跨点改派（reassign）**：对未取消且尚未开始的预约，访客可凭同一取消
+    凭证把到访**改派到另一回收点**：请求给出原预约号、取消凭证、期望修订号、
+    本次改派幂等键、目标点编号与带时区的新起止时间。新窗口按**目标点**的
+    现有预约规则校验（提前期/最长时长/**目标点当前已发布日历**的连续开放
+    区间/目标点未取消预约不重叠）。校验通过后**在同一事务内**：原预约取消
+    并释放时段、按现有规则尝试转正**原点**候补、目标点生成**新预约号与新
+    取消凭证**（修订号从 `1` 开始，所依据规则版本为目标点当前版本），响应
+    同时返回新旧预约状态与目标规则版本。任一校验或候补转正失败整体回滚，
+    原预约与目标点占用均保持不变。两点状态在同一事务提交；改派对两个回收点
+    行锁**按编号升序**加锁，与预约创建/取消/改期/规则发布/候补转正串行，
+    并发改派（含相向改派）不会双占用也不会死锁。同一原预约同一改派键
+    **同内容**重试返回首次生成的新预约快照（窗口/目标规则版本/修订号 `1`
+    为首次内容，状态字段反映当前状态），**异内容**报 `idempotency_conflict`；
+    对象不存在、凭证错误、已取消或已开始、修订号过期沿用取消/改期接口的
+    404/403/409 语义。原创建键重试仍返回首次创建快照（状态为已取消）。
   - **候补（waitlist）**：当目标时段已被**未取消预约**占用时，访客可提交
     UTC 起止时间与幂等键申请候补。窗口本身必须通过与创建预约**相同的校验**
     （未来起点/可约天数/最长时长，且完整落在**当前已发布**日历的一段连续
@@ -242,6 +258,7 @@ GET /points/{id}/calendar?from=YYYY-MM-DD&to=YYYY-MM-DD[&version=N]
 | --- | --- | --- |
 | `POST` | `/points/{id}/reservations` | 创建预约（201；同键同内容重试为 200） |
 | `POST` | `/points/{id}/reservations/{rid}/reschedule` | 凭取消凭证改期（200；同键同内容重试原样返回） |
+| `POST` | `/points/{id}/reservations/{rid}/reassign` | 凭取消凭证改派到另一回收点（200；同键同内容重试返回首次结果） |
 | `POST` | `/points/{id}/reservations/{rid}/cancel` | 凭取消凭证取消（200，可重复；释放时同事务转正候补） |
 
 创建请求体（`start`/`end` 为带时区偏移的 ISO-8601 时间戳，统一按 UTC 解释）：
@@ -332,6 +349,85 @@ GET /points/{id}/calendar?from=YYYY-MM-DD&to=YYYY-MM-DD[&version=N]
   `409 outside_open_hours`；与同点**其他**未取消预约重叠返回
   `409 reservation_overlap`。
 - 任一失败均在同一事务内回滚：原时段继续被占用，修订号与窗口不变。
+
+#### 改派（reassign，跨点）
+
+把一次到访从原回收点改派到**另一回收点**：
+
+```
+POST /points/{id}/reservations/{rid}/reassign
+```
+
+请求体：
+
+```json
+{
+  "cancel_token": "r9vQ…",
+  "idempotency_key": "reassign-order-0001-to-point-2",
+  "expected_revision": 1,
+  "target_point_id": 2,
+  "start": "2026-10-01T11:00:00Z",
+  "end": "2026-10-01T11:30:00Z"
+}
+```
+
+- `cancel_token` / `expected_revision` / `idempotency_key` 语义与改期一致
+  （改派幂等键按**原预约**隔离，与创建键、改期键相互独立）。
+- `target_point_id` 必须是**另一个**回收点；与本点相同返回
+  `422 invalid_request`（同点换时间请用改期接口）。
+- `start`/`end` 为带时区偏移的新起止时间，按 **目标点** 的现有预约规则
+  校验：提前期与最长时长（`422 invalid_period`）、目标点**当前已发布**
+  日历的连续开放区间（`409 outside_open_hours`）、目标点未取消预约不重叠
+  （`409 reservation_overlap`）；目标点尚无已发布规则返回
+  `409 no_published_version`。
+
+成功返回 200，新旧预约状态与目标规则版本：
+
+```json
+{
+  "source_reservation": {
+    "id": 7,
+    "point_id": 1,
+    "status": "cancelled",
+    "revision": 1,
+    "start": "2026-10-01T09:00:00Z",
+    "end": "2026-10-01T10:00:00Z",
+    "rules_version": 3,
+    "created_at": "2026-09-30T08:00:00Z",
+    "cancelled_at": "2026-09-30T09:12:00Z"
+  },
+  "target_reservation": {
+    "id": 42,
+    "point_id": 2,
+    "status": "active",
+    "revision": 1,
+    "start": "2026-10-01T11:00:00Z",
+    "end": "2026-10-01T11:30:00Z",
+    "rules_version": 5,
+    "cancel_token": "kX2p…",
+    "created_at": "2026-09-30T09:12:00Z",
+    "cancelled_at": null
+  },
+  "target_rules_version": 5
+}
+```
+
+- 两点状态在**同一事务**提交：原预约取消并释放时段（同事务按现有规则
+  尝试转正原点候补），目标点生成**新预约号与新取消凭证**（修订号 `1`，
+  所依据规则版本为目标点当前版本）。任一校验或候补转正失败整体回滚，
+  原预约与目标点占用均不变。
+- 同一原预约同一改派键**同内容**重试返回首次生成的新预约快照（HTTP 200，
+  窗口/目标规则版本/修订号 `1` 为首次内容，状态字段反映当前状态）；
+  **异内容**返回 `409 idempotency_conflict`（`details` 给出该键已存的
+  目标点与窗口）。
+- 预约不存在、凭证错误沿用取消接口的 404/403 语义；已取消或已开始返回
+  `409 reservation_not_reschedulable`；期望修订号过期返回
+  `409 revision_conflict`；目标点不存在返回 `404 point_not_found`。
+- 改派对两个回收点行锁**按编号升序**加锁，与创建/取消/改期/规则发布/
+  候补转正串行：并发改派（含两点相向改派）、并发预约与规则发布不会
+  双占用也不会死锁。
+- 原预约的**创建幂等键**不受影响：同内容重试仍返回首次创建快照
+  （状态字段为取消后的当前状态）。
 
 ### 4.5 候补（waitlist）
 
@@ -425,22 +521,22 @@ GET /points/{id}/calendar?from=YYYY-MM-DD&to=YYYY-MM-DD[&version=N]
 | 404 | `point_not_found` | 回收点不存在 |
 | 404 | `version_not_found` | 指定的已发布版本不存在 |
 | 404 | `reservation_not_found` | 预约号不存在（或不属于该回收点） |
-| 403 | `invalid_cancel_token` | 取消时未提供凭证或凭证不匹配 |
-| 409 | `no_published_version` | 尚无已发布规则（当前版本为 0）就查询日历或创建预约 |
+| 403 | `invalid_cancel_token` | 取消/改期/改派时未提供凭证或凭证不匹配 |
+| 409 | `no_published_version` | 尚无已发布规则（当前版本为 0）就查询日历或创建预约；改派目标点无已发布规则 |
 | 409 | `version_conflict` | `expected_version` 与服务端当前版本不符（`details` 给出双方版本号） |
-| 409 | `idempotency_conflict` | 同一回收点同一幂等键提交了不同的起止时间（`details` 给出已存预约） |
-| 409 | `reservation_overlap` | 与同点未取消预约 UTC 时间重叠（创建时；改期时忽略自身，`details` 给出冲突预约号） |
-| 409 | `outside_open_hours` | 预约（或改期后的新窗口）未完整落在当前已发布日历的任一段连续开放区间内 |
-| 409 | `revision_conflict` | 改期 `expected_revision` 与预约当前修订号不符（`details` 给出双方修订号） |
-| 409 | `reservation_not_reschedulable` | 改期对象已取消或已开始（`details.reason` 区分 `reservation_cancelled` / `reservation_started`） |
+| 409 | `idempotency_conflict` | 同一幂等作用域同键提交了不同内容（`details` 给出已存内容；改派作用域为原预约） |
+| 409 | `reservation_overlap` | 与同点未取消预约 UTC 时间重叠（创建时；改期时忽略自身；改派时按目标点判定，`details` 给出冲突预约号） |
+| 409 | `outside_open_hours` | 预约（或改期/改派后的新窗口）未完整落在相应点当前已发布日历的任一段连续开放区间内 |
+| 409 | `revision_conflict` | 改期/改派 `expected_revision` 与预约当前修订号不符（`details` 给出双方修订号） |
+| 409 | `reservation_not_reschedulable` | 改期/改派对象已取消或已开始（`details.reason` 区分 `reservation_cancelled` / `reservation_started`） |
 | 409 | `reservation_change_conflict` | 发布规则或修改时区将使未取消预约不再完整开放（`details.conflicting_reservation_ids` 给出冲突预约号） |
 | 404 | `waitlist_entry_not_found` | 候补号不存在（或不属于该回收点） |
 | 403 | `invalid_waitlist_token` | 查询/撤回候补时未提供查询密钥或密钥不匹配 |
 | 409 | `waitlist_window_available` | 候补窗口当前空闲可直接预约（请走原预约流程），或不满足候补前提 |
 | 409 | `waitlist_entry_not_active` | 对已转正或已失效的申请执行撤回（排队中撤回与已撤回的重复撤回幂等） |
-| 422 | `invalid_period` | 无效时段：星期越界、时间格式错、常规起终点相等、补开跨日/零长度、重复规则、日期范围倒置/超限；预约终点不晚于起点、超过最长时长、起点在过去或超出可约天数；候补窗口同样适用预约时段策略 |
+| 422 | `invalid_period` | 无效时段：星期越界、时间格式错、常规起终点相等、补开跨日/零长度、重复规则、日期范围倒置/超限；预约终点不晚于起点、超过最长时长、起点在过去或超出可约天数；候补与改派窗口同样适用预约时段策略 |
 | 422 | `unknown_timezone` | 无法识别的 IANA 时区 |
-| 422 | `invalid_request` | 请求体结构未通过校验（字段缺失、类型错误、时间戳缺时区偏移等） |
+| 422 | `invalid_request` | 请求体结构未通过校验（字段缺失、类型错误、时间戳缺时区偏移等）；改派目标点与原点相同 |
 
 ---
 
@@ -488,6 +584,19 @@ curl -s -X POST localhost:8000/points/1/reservations/7/reschedule \
        "expected_revision":1,
        "start":"2026-10-01T11:00:00Z",
        "end":"2026-10-01T11:30:00Z"}'
+
+# 凭同一取消凭证把到访改派到另一回收点（目标点 2 须已发布覆盖新窗口的规则）
+curl -s -X POST localhost:8000/points/1/reservations/7/reassign \
+  -H 'Content-Type: application/json' \
+  -d '{"cancel_token":"<创建响应中的 cancel_token>",
+       "idempotency_key":"reassign-visit-7-to-point-2",
+       "expected_revision":1,
+       "target_point_id":2,
+       "start":"2026-10-01T11:00:00Z",
+       "end":"2026-10-01T11:30:00Z"}'
+# -> 200：source_reservation 为已取消的原预约，
+#    target_reservation 为目标点的新预约（新预约号、新取消凭证、revision 1），
+#    target_rules_version 为目标点当前规则版本；同键同内容重试原样返回。
 
 # 对已被占用的窗口申请候补（空闲窗口请改用上面的预约接口）
 curl -s -X POST localhost:8000/points/1/waitlist \
@@ -540,6 +649,13 @@ pytest -q
   唯一转正且只能一次）、转正凭证按转正时规则版本签发、转正预约的实时快照
   与凭证可用、规则改窄后暂留再开放后转正、转正失败回滚释放与候补状态、
   并发取消/预约/撤回/双取消下不重不叠、既有创建/取消/改期响应与错误兼容。
+- 改派：成功改派（原预约取消释放时段、原点候补同事务转正、目标点新预约号
+  与新凭证、目标规则版本）、同键同内容重放首次新预约快照（含目标预约后被
+  取消的状态反映）、异内容冲突、键按原预约隔离且与创建/改期键独立、目标点
+  不存在/无已发布规则/窗口策略/开放区间（含目标点时区日历）/重叠校验失败
+  时两点状态均不变、已取消/已开始/修订号过期/凭证错误沿用既有语义、同点
+  改派拒绝、原创建键重试仍返回初建快照、并发改派（同预约双向、两点相向）
+  与并发预约/规则发布下不双占用不死锁且无 500。
 - 全部可区分错误码。
 
 ---
@@ -550,12 +666,12 @@ pytest -q
 app/
   config.py      环境变量配置
   schema.sql     PostgreSQL 建表脚本（启动时幂等执行）
-  db.py          连接池、版本化规则的原子发布与读取、预约与候补存储（行锁 + 事务 + 释放转正扫描）
+  db.py          连接池、版本化规则的原子发布与读取、预约/改期/改派与候补存储（行锁 + 事务 + 释放转正扫描）
   scheduler.py   纯 Python 日历展开引擎（跨午夜/停开/补开/合并/DST/连续开放区间）
   schemas.py     Pydantic 请求响应模型与时段语义校验
   errors.py      可区分错误类型
   main.py        FastAPI 路由与错误处理
-examples/        curl 与 Python 调用示例（含候补全流程）
-tests/           引擎单测 + 真实 PostgreSQL 的 API 集成测试（含候补）
+examples/        curl 与 Python 调用示例（含候补与改派全流程）
+tests/           引擎单测 + 真实 PostgreSQL 的 API 集成测试（含候补与改派）
 Dockerfile, docker-compose.yml
 ```

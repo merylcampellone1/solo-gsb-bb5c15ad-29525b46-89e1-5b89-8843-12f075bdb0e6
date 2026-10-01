@@ -306,3 +306,74 @@ api POST "/points/$WPID/reservations/$HOLD_ID/cancel" "{\"cancel_token\":\"$HOLD
 echo
 echo "-- waitlist status now reports promoted + reservation number/cancel token --"
 api GET "/points/$WPID/waitlist/$WID?query_token=$WTOKEN"
+
+echo
+echo "== 9. Reassign (改派): move a visit to another recycling point =="
+# A second point with its own published calendar acts as the reassign target.
+TPOINT_JSON="$(api POST /points '{"name":"改派目标点","timezone":"UTC"}')"
+echo "$TPOINT_JSON"
+TPID="$(echo "$TPOINT_JSON" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+api POST "/points/$TPID/rules" "{
+  \"expected_version\": 0,
+  \"rules\": {
+    \"weekly\": [{\"weekday\": $WD, \"start_time\": \"08:00\", \"end_time\": \"12:00\"}],
+    \"closed_dates\": [],
+    \"makeup\": []
+  }
+}"
+
+echo
+echo "-- a fresh visit booked at the source point (201; 11:00-11:30 is still free) --"
+SRC_JSON="$(api POST "/points/$RPID/reservations" "{
+  \"idempotency_key\": \"reassign-demo-visit\",
+  \"start\": \"${D1}T11:00:00Z\",
+  \"end\": \"${D1}T11:30:00Z\"
+}")"
+echo "$SRC_JSON"
+SRC_ID="$(echo "$SRC_JSON" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+SRC_TOKEN="$(echo "$SRC_JSON" | sed -n 's/.*"cancel_token":"\([^"]*\)".*/\1/p')"
+
+echo
+echo "-- reassign it to the target point 10:00-10:30 (200) --"
+REASSIGN_BODY="{
+  \"cancel_token\": \"$SRC_TOKEN\",
+  \"idempotency_key\": \"reassign-demo-1\",
+  \"expected_revision\": 1,
+  \"target_point_id\": $TPID,
+  \"start\": \"${D1}T10:00:00Z\",
+  \"end\": \"${D1}T10:30:00Z\"
+}"
+REASSIGN_JSON="$(api POST "/points/$RPID/reservations/$SRC_ID/reassign" "$REASSIGN_BODY")"
+echo "$REASSIGN_JSON"
+NEW_ID="$(echo "$REASSIGN_JSON" | sed -n 's/.*"target_reservation":{"id":\([0-9]*\).*/\1/p')"
+NEW_TOKEN="$(echo "$REASSIGN_JSON" | sed -n 's/.*"target_reservation":{[^}]*"cancel_token":"\([^"]*\)".*/\1/p')"
+
+echo
+echo "-- same reassign key + same content replays the first result (200) --"
+api POST "/points/$RPID/reservations/$SRC_ID/reassign" "$REASSIGN_BODY"
+
+echo
+echo "-- same reassign key + different content conflicts (409 idempotency_conflict) --"
+api POST "/points/$RPID/reservations/$SRC_ID/reassign" "{
+  \"cancel_token\": \"$SRC_TOKEN\",
+  \"idempotency_key\": \"reassign-demo-1\",
+  \"expected_revision\": 1,
+  \"target_point_id\": $TPID,
+  \"start\": \"${D1}T11:00:00Z\",
+  \"end\": \"${D1}T11:30:00Z\"
+}"
+
+echo
+echo "-- the source reservation is cancelled; reassigning again is refused (409) --"
+api POST "/points/$RPID/reservations/$SRC_ID/reassign" "{
+  \"cancel_token\": \"$SRC_TOKEN\",
+  \"idempotency_key\": \"reassign-demo-2\",
+  \"expected_revision\": 1,
+  \"target_point_id\": $TPID,
+  \"start\": \"${D1}T11:00:00Z\",
+  \"end\": \"${D1}T11:30:00Z\"
+}"
+
+echo
+echo "-- the new reservation at the target point cancels with its own token (200) --"
+api POST "/points/$TPID/reservations/$NEW_ID/cancel" "{\"cancel_token\":\"$NEW_TOKEN\"}"

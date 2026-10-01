@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import secrets
 from datetime import date, datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 
@@ -17,6 +18,7 @@ from .errors import ApiError
 from .errors import (
     IdempotencyConflictError,
     InvalidPeriodError,
+    InvalidRequestError,
     InvalidWaitlistTokenError,
     OutsideOpenHoursError,
     ReservationNotReschedulableError,
@@ -33,9 +35,11 @@ from .schemas import (
     PointUpdateIn,
     PublishOut,
     PublishRulesIn,
+    ReassignOut,
     ReservationCancelIn,
     ReservationCreateIn,
     ReservationOut,
+    ReservationReassignIn,
     ReservationRescheduleIn,
     ReservationStateOut,
     VersionOut,
@@ -636,6 +640,212 @@ def reschedule_reservation(
             # status / cancel token / created_at are unchanged, so the locked
             # ``resv`` row plus the stored attempt fully describe the result.
             return _reschedule_replay_out(resv, attempt)
+
+
+def _reassign_out(
+    source_row: dict, target_row: dict, target_rules_version: int
+) -> ReassignOut:
+    """Fresh reassign result: cancelled source + newly booked target."""
+    return ReassignOut(
+        source_reservation=_reservation_state_out(source_row),
+        target_reservation=_reservation_out(target_row),
+        target_rules_version=target_rules_version,
+    )
+
+
+def _reassign_replay_out(cur, source_row: dict, attempt: dict) -> ReassignOut:
+    """Replay of a successful reassign attempt.
+
+    The target reservation is reported as its *first generated* snapshot
+    (original window, target rules version, revision 1 — it is a fresh
+    creation at the target point) while its status fields reflect the live
+    row, mirroring creation-key replay semantics.  The source reservation is
+    reported as it stands now (cancelled by the reassignment).
+    """
+    target_row = db.get_reservation_by_id(cur, attempt["target_reservation_id"])
+    return ReassignOut(
+        source_reservation=_reservation_state_out(source_row),
+        target_reservation=_creation_replay_out(target_row),
+        target_rules_version=attempt["target_rules_version"],
+    )
+
+
+@app.post(
+    "/points/{point_id}/reservations/{reservation_id}/reassign",
+    response_model=ReassignOut,
+    tags=["reservations"],
+)
+def reassign_reservation(
+    point_id: int, reservation_id: int, body: ReservationReassignIn
+) -> ReassignOut:
+    if body.target_point_id == point_id:
+        raise InvalidRequestError(
+            "target_point_id must name a different recycling point than the "
+            "source; use the reschedule endpoint for same-point moves",
+            details={"point_id": point_id, "target_point_id": body.target_point_id},
+        )
+    start = body.start.astimezone(timezone.utc)
+    end = body.end.astimezone(timezone.utc)
+    now = datetime.now(timezone.utc)
+    with db.conn() as connection:
+        with connection.transaction():
+            cur = connection.cursor()
+            # Lock both point rows in ascending id order.  Every other
+            # mutation takes exactly one point lock, and a reassign in the
+            # opposite direction takes the same two locks in the same order,
+            # so concurrent reassigns / bookings / publishes serialize
+            # without deadlock and cannot double-book a window.
+            points = {}
+            for pid in sorted({point_id, body.target_point_id}):
+                points[pid] = db.lock_point(cur, pid)
+            source_point = points[point_id]
+            target_point = points[body.target_point_id]
+
+            # 404 / 403 semantics mirror the cancel and reschedule endpoints:
+            # existence first, then the capability token.
+            resv = db.get_reservation_for_update(cur, point_id, reservation_id)
+            db.check_cancel_token(resv, body.cancel_token)
+
+            # Reassign idempotency is scoped to the source reservation: same
+            # key + same content replays the first generated target
+            # reservation; same key + different content conflicts.  Replay
+            # wins over every other state/revision check.
+            attempt = db.get_reassign_by_key(
+                cur, reservation_id, body.idempotency_key
+            )
+            if attempt is not None:
+                if (
+                    attempt["target_point_id"] == body.target_point_id
+                    and attempt["start_utc"] == start
+                    and attempt["end_utc"] == end
+                ):
+                    return _reassign_replay_out(cur, resv, attempt)
+                raise IdempotencyConflictError(
+                    f"reassign idempotency key {body.idempotency_key!r} was "
+                    f"already used on reservation {reservation_id} with "
+                    f"different content",
+                    details={
+                        "reservation_id": reservation_id,
+                        "target_point_id": attempt["target_point_id"],
+                        "start": utc_iso(attempt["start_utc"]),
+                        "end": utc_iso(attempt["end_utc"]),
+                    },
+                )
+
+            if resv["status"] == "cancelled":
+                raise ReservationNotReschedulableError(
+                    f"reservation {reservation_id} is cancelled and cannot be "
+                    f"reassigned",
+                    details={
+                        "reservation_id": reservation_id,
+                        "status": "cancelled",
+                        "reason": "reservation_cancelled",
+                    },
+                )
+            if resv["start_utc"] <= now:
+                raise ReservationNotReschedulableError(
+                    f"reservation {reservation_id} has already started and "
+                    f"cannot be reassigned",
+                    details={
+                        "reservation_id": reservation_id,
+                        "status": resv["status"],
+                        "reason": "reservation_started",
+                        "start": utc_iso(resv["start_utc"]),
+                        "now": utc_iso(now),
+                    },
+                )
+            if resv["revision"] != body.expected_revision:
+                raise RevisionConflictError(
+                    f"expected revision {body.expected_revision} but reservation "
+                    f"{reservation_id} is at revision {resv['revision']}",
+                    details={
+                        "reservation_id": reservation_id,
+                        "expected_revision": body.expected_revision,
+                        "current_revision": resv["revision"],
+                    },
+                )
+
+            # The target window follows the same booking policy as an
+            # ordinary reservation: lead time, duration, one continuous open
+            # interval of the target point's currently published calendar,
+            # and no overlap with that point's active reservations.
+            validate_reservation_window(
+                start,
+                end,
+                now,
+                max_days_ahead=settings.reservation_max_days_ahead,
+                max_duration=timedelta(
+                    minutes=settings.reservation_max_duration_minutes
+                ),
+            )
+            _, target_rules = db.get_current_rules(cur, body.target_point_id)
+            zone = get_zone(target_point["timezone"])
+            ruleset = payload_to_ruleset(target_rules["payload"])
+            date_from = (start - timedelta(days=1)).astimezone(zone).date()
+            date_to = (end + timedelta(days=1)).astimezone(zone).date()
+            intervals = build_open_intervals(
+                target_point["timezone"], ruleset, date_from, date_to
+            )
+            if not any(s <= start and end <= e for s, e in intervals):
+                raise OutsideOpenHoursError(
+                    "reassigned window is not fully contained in one "
+                    "continuous open interval of the target point's "
+                    "published calendar",
+                    details={
+                        "reservation_id": reservation_id,
+                        "target_point_id": body.target_point_id,
+                        "start": utc_iso(start),
+                        "end": utc_iso(end),
+                        "rules_version": target_rules["version"],
+                    },
+                )
+            overlapping = db.find_overlapping(cur, body.target_point_id, start, end)
+            if overlapping:
+                raise ReservationOverlapError(
+                    "reassigned window overlaps an active reservation at the "
+                    "target point",
+                    details={
+                        "conflicting_reservation_ids": [r["id"]]
+                        for r in overlapping
+                    },
+                )
+
+            # All validations passed: cancel the source reservation (this
+            # releases its window) and, per the existing release rules, try
+            # to promote the origin point's waitlist in the same transaction.
+            cancelled, released = db.cancel_reservation(
+                cur, point_id, reservation_id, body.cancel_token
+            )
+            assert released  # status was verified "active" above
+            _, source_rules = db.get_current_rules(cur, point_id)
+            db.promote_waitlist(cur, source_point, source_rules, now)
+
+            # Book the new reservation at the target point with a
+            # server-generated creation key and a fresh cancel token.
+            new_reservation = db.insert_reservation(
+                cur,
+                body.target_point_id,
+                f"__reassign__:{reservation_id}:{secrets.token_urlsafe(16)}",
+                start,
+                end,
+                target_rules["version"],
+            )
+            db.insert_reassign(
+                cur,
+                reservation_id=reservation_id,
+                source_point_id=point_id,
+                target_point_id=body.target_point_id,
+                idempotency_key=body.idempotency_key,
+                expected_revision=body.expected_revision,
+                start_utc=start,
+                end_utc=end,
+                target_reservation_id=new_reservation["id"],
+                target_rules_version=target_rules["version"],
+            )
+            # Any failure above (validation or waitlist promotion) aborts the
+            # transaction, leaving the source reservation and the target
+            # point's occupancy untouched.
+            return _reassign_out(cancelled, new_reservation, target_rules["version"])
 
 
 # ---------------------------------------------------------------------------

@@ -91,6 +91,31 @@ CREATE TABLE IF NOT EXISTS reservation_reschedules (
 CREATE INDEX IF NOT EXISTS idx_reservation_reschedules_reservation
     ON reservation_reschedules (reservation_id);
 
+-- One row per successful cross-point reassignment (改派).  A reassign cancels
+-- the source reservation and books a brand-new reservation at another point in
+-- the same transaction.  (reservation_id, idempotency_key) is the idempotency
+-- scope of a reassign attempt: same key + same content replays the first
+-- generated target reservation, different content conflicts.
+CREATE TABLE IF NOT EXISTS reservation_reassigns (
+    id                   BIGSERIAL PRIMARY KEY,
+    reservation_id       BIGINT NOT NULL
+                         REFERENCES reservations(id) ON DELETE CASCADE,
+    source_point_id      BIGINT NOT NULL,
+    target_point_id      BIGINT NOT NULL,
+    idempotency_key      TEXT NOT NULL,
+    expected_revision    INTEGER NOT NULL,     -- optimistic revision the client saw
+    start_utc            TIMESTAMPTZ NOT NULL, -- window booked at the target point
+    end_utc              TIMESTAMPTZ NOT NULL,
+    target_reservation_id BIGINT NOT NULL
+                         REFERENCES reservations(id) ON DELETE CASCADE,
+    target_rules_version INTEGER NOT NULL,     -- target rules version validated against
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (reservation_id, idempotency_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_reservation_reassigns_reservation
+    ON reservation_reassigns (reservation_id);
+
 -- Waitlist (候补) entries.  A visitor may only join the waitlist for a window
 -- that *would* be bookable under the current rules but is currently taken by an
 -- active (non-cancelled) reservation.  (point_id, idempotency_key) is the
