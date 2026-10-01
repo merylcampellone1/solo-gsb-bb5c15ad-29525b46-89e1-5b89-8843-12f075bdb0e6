@@ -325,6 +325,106 @@ def main() -> None:
     )
     show("waitlist entry is now promoted and carries the reservation", status, w_state)
 
+    # ------------------------------------------------------------------
+    # Cross-point reassignment (到访改派): move a visit onto another point.
+    # ------------------------------------------------------------------
+    status, target_point = call(
+        "POST", "/points", {"name": "改派目标点", "timezone": "UTC"}
+    )
+    show("create a second point to move the visit to", status, target_point)
+    tgt_pid = target_point["id"]
+    status, published = call(
+        "POST",
+        f"/points/{tgt_pid}/rules",
+        {
+            "expected_version": 0,
+            "rules": {
+                "weekly": [
+                    {"weekday": weekday, "start_time": "08:00", "end_time": "17:00"}
+                ],
+                "closed_dates": [],
+                "makeup": [],
+            },
+        },
+    )
+    show("publish the target point calendar", status, published)
+
+    # A fresh active visit on the first point to move across.  The earlier
+    # demo flow already holds 08:00-11:30, so take the 11:30-12:00 slice.
+    _, mover = call(
+        "POST",
+        f"/points/{rpid}/reservations",
+        {
+            "idempotency_key": "visit-demo-reassign",
+            "start": f"{tomorrow}T11:30:00Z",
+            "end": f"{tomorrow}T12:00:00Z",
+        },
+    )
+    show("book a visit to move", 201, mover)
+
+    reassign_body = {
+        "cancel_token": mover["cancel_token"],
+        "target_point_id": tgt_pid,
+        "idempotency_key": "visit-demo-reassign-1",
+        "expected_revision": 1,
+        "start": f"{tomorrow}T11:00:00Z",
+        "end": f"{tomorrow}T11:30:00Z",
+    }
+    status, reassigned = call(
+        "POST",
+        f"/points/{rpid}/reservations/{mover['id']}/reassign",
+        reassign_body,
+    )
+    show(
+        "reassign to the target point: source cancelled, new reservation issued",
+        status,
+        reassigned,
+    )
+
+    status, re_replay = call(
+        "POST",
+        f"/points/{rpid}/reservations/{mover['id']}/reassign",
+        reassign_body,
+    )
+    show("same reassign key + content replays the first snapshot (200)", status, re_replay)
+
+    status, re_conflict = call(
+        "POST",
+        f"/points/{rpid}/reservations/{mover['id']}/reassign",
+        {
+            **reassign_body,
+            "start": f"{tomorrow}T12:00:00Z",
+            "end": f"{tomorrow}T12:30:00Z",
+        },
+    )
+    show("same reassign key, different content conflicts", status, re_conflict)
+
+    # The origin creation key is unaffected and still replays its first window.
+    status, create_replay = call(
+        "POST",
+        f"/points/{rpid}/reservations",
+        {
+            "idempotency_key": "visit-demo-reassign",
+            "start": f"{tomorrow}T11:30:00Z",
+            "end": f"{tomorrow}T12:00:00Z",
+        },
+    )
+    show(
+        "origin creation key still returns its first snapshot (now cancelled)",
+        status,
+        create_replay,
+    )
+
+    # The new reservation lives on the target point with its own cancel token.
+    if status == 200:
+        new_reservation = reassigned["new_reservation"]
+        status, cancelled_target = call(
+            "POST",
+            f"/points/{tgt_pid}/reservations/{new_reservation['id']}/cancel",
+            {"cancel_token": new_reservation["cancel_token"]},
+        )
+        show("cancel the moved reservation on the target point", status, cancelled_target)
+
 
 if __name__ == "__main__":
     main()

@@ -535,6 +535,80 @@ def assert_reservations_fit(
 
 
 # ---------------------------------------------------------------------------
+# Cross-point reassignment (改派)
+# ---------------------------------------------------------------------------
+
+_REASSIGN_COLS = (
+    "id, source_reservation_id, source_point_id, target_point_id, "
+    "idempotency_key, expected_revision, new_reservation_id, start_utc, "
+    "end_utc, rules_version, created_at"
+)
+
+
+def lock_two_points(cur: psycopg.Cursor, point_a: int, point_b: int) -> None:
+    """Lock two distinct point rows in a deadlock-free order.
+
+    Every path that mutates two points (cross-point reassignment) acquires
+    the point locks in ascending ``id`` order, the same global order that
+    single-point mutations use, so mutually reassigning transactions cannot
+    deadlock.
+    """
+    for pid in sorted((point_a, point_b)):
+        lock_point(cur, pid)
+
+
+def get_reassignment_by_key(
+    cur: psycopg.Cursor, source_reservation_id: int, idempotency_key: str
+) -> dict | None:
+    return cur.execute(
+        f"SELECT {_REASSIGN_COLS} FROM reservation_reassignments "
+        "WHERE source_reservation_id = %s AND idempotency_key = %s",
+        (source_reservation_id, idempotency_key),
+    ).fetchone()
+
+
+def mark_reservation_cancelled(cur: psycopg.Cursor, row: dict) -> dict:
+    """Flip an already-locked active reservation to cancelled."""
+    return cur.execute(
+        f"UPDATE reservations SET status = 'cancelled', cancelled_at = now() "
+        f"WHERE id = %s RETURNING {_RESERVATION_COLS}",
+        (row["id"],),
+    ).fetchone()
+
+
+def insert_reassignment(
+    cur: psycopg.Cursor,
+    source_row: dict,
+    target_point_id: int,
+    idempotency_key: str,
+    expected_revision: int,
+    new_reservation: dict,
+    start_utc: datetime,
+    end_utc: datetime,
+    rules_version: int,
+) -> dict:
+    return cur.execute(
+        "INSERT INTO reservation_reassignments "
+        "(source_reservation_id, source_point_id, target_point_id, "
+        " idempotency_key, expected_revision, new_reservation_id, "
+        " start_utc, end_utc, rules_version) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+        f"RETURNING {_REASSIGN_COLS}",
+        (
+            source_row["id"],
+            source_row["point_id"],
+            target_point_id,
+            idempotency_key,
+            expected_revision,
+            new_reservation["id"],
+            start_utc,
+            end_utc,
+            rules_version,
+        ),
+    ).fetchone()
+
+
+# ---------------------------------------------------------------------------
 # Waitlist (候补)
 # ---------------------------------------------------------------------------
 

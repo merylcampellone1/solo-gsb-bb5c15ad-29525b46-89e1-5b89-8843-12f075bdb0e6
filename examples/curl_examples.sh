@@ -306,3 +306,96 @@ api POST "/points/$WPID/reservations/$HOLD_ID/cancel" "{\"cancel_token\":\"$HOLD
 echo
 echo "-- waitlist status now reports promoted + reservation number/cancel token --"
 api GET "/points/$WPID/waitlist/$WID?query_token=$WTOKEN"
+
+echo
+echo "== 9. Cross-point reassignment (到访改派) =="
+# A second point to move the visit to; publish the same weekday window.
+TPOINT_JSON="$(api POST /points '{"name":"改派目标点","timezone":"UTC"}')"
+echo "$TPOINT_JSON"
+TPID="$(echo "$TPOINT_JSON" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+api POST "/points/$TPID/rules" "{
+  \"expected_version\": 0,
+  \"rules\": {
+    \"weekly\": [{\"weekday\": $WD, \"start_time\": \"08:00\", \"end_time\": \"17:00\"}],
+    \"closed_dates\": [],
+    \"makeup\": []
+  }
+}"
+
+echo
+echo "-- book a fresh visit on the waitlist demo point to move --"
+MV_JSON="$(api POST "/points/$WPID/reservations" "{
+  \"idempotency_key\": \"demo-reassign-holder\",
+  \"start\": \"${D1}T10:00:00Z\",
+  \"end\": \"${D1}T10:30:00Z\"
+}")"
+echo "$MV_JSON"
+MVID="$(echo "$MV_JSON" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+MVTOKEN="$(echo "$MV_JSON" | sed -n 's/.*"cancel_token":"\([^"]*\)".*/\1/p')"
+
+echo
+echo "-- reassign it to the target point 11:00-11:30 (201; new number + new token) --"
+RA_JSON="$(api POST "/points/$WPID/reservations/$MVID/reassign" "{
+  \"cancel_token\": \"$MVTOKEN\",
+  \"target_point_id\": $TPID,
+  \"idempotency_key\": \"demo-reassign-1\",
+  \"expected_revision\": 1,
+  \"start\": \"${D1}T11:00:00Z\",
+  \"end\": \"${D1}T11:30:00Z\"
+}")"
+echo "$RA_JSON"
+NTOKEN="$(echo "$RA_JSON" | sed -n 's/.*\"new_reservation\":{[^}]*\"cancel_token\":\"\([^\"]*\)\".*/\1/p')"
+NID="$(echo "$RA_JSON" | sed -n 's/.*\"new_reservation\":{\"id\":\([0-9]*\).*/\1/p')"
+
+echo
+echo "-- same reassign key + same content replays the first new-reservation snapshot (200) --"
+api POST "/points/$WPID/reservations/$MVID/reassign" "{
+  \"cancel_token\": \"$MVTOKEN\",
+  \"target_point_id\": $TPID,
+  \"idempotency_key\": \"demo-reassign-1\",
+  \"expected_revision\": 1,
+  \"start\": \"${D1}T11:00:00Z\",
+  \"end\": \"${D1}T11:30:00Z\"
+}"
+
+echo
+echo "-- same key + different content conflicts (409 idempotency_conflict) --"
+api POST "/points/$WPID/reservations/$MVID/reassign" "{
+  \"cancel_token\": \"$MVTOKEN\",
+  \"target_point_id\": $TPID,
+  \"idempotency_key\": \"demo-reassign-1\",
+  \"expected_revision\": 1,
+  \"start\": \"${D1}T12:00:00Z\",
+  \"end\": \"${D1}T12:30:00Z\"
+}"
+
+echo
+echo "-- the source is cancelled and its window freed: 10:00-10:30 can be booked again --"
+api POST "/points/$WPID/reservations" "{
+  \"idempotency_key\": \"demo-reassign-refill\",
+  \"start\": \"${D1}T10:00:00Z\",
+  \"end\": \"${D1}T10:30:00Z\"
+}"
+
+echo
+echo "-- reassigning a reservation onto its own point is invalid (422 invalid_period) --"
+# (demoed on the still-active holder before it is cancelled below)
+SELF_JSON="$(api POST "/points/$TPID/reservations" "{
+  \"idempotency_key\": \"demo-self-point\",
+  \"start\": \"${D1}T15:00:00Z\",
+  \"end\": \"${D1}T15:30:00Z\"
+}")"
+SELFID="$(echo "$SELF_JSON" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+SELFTOKEN="$(echo "$SELF_JSON" | sed -n 's/.*"cancel_token":"\([^"]*\)".*/\1/p')"
+api POST "/points/$TPID/reservations/$SELFID/reassign" "{
+  \"cancel_token\": \"$SELFTOKEN\",
+  \"target_point_id\": $TPID,
+  \"idempotency_key\": \"demo-reassign-self\",
+  \"expected_revision\": 1,
+  \"start\": \"${D1}T16:00:00Z\",
+  \"end\": \"${D1}T16:30:00Z\"
+}"
+
+echo
+echo "-- the new reservation on the target point uses its own token (cancel there) --"
+api POST "/points/$TPID/reservations/$NID/cancel" "{\"cancel_token\": \"$NTOKEN\"}"

@@ -91,6 +91,36 @@ CREATE TABLE IF NOT EXISTS reservation_reschedules (
 CREATE INDEX IF NOT EXISTS idx_reservation_reschedules_reservation
     ON reservation_reschedules (reservation_id);
 
+-- One row per successful cross-point reassignment (改派).  The original
+-- reservation is cancelled on its home point and a brand-new reservation is
+-- issued on the target point.  (source_reservation_id, idempotency_key) is the
+-- idempotency scope of a reassignment attempt: same key + same content replays
+-- this row (the first generated new-reservation snapshot), different content
+-- conflicts.  The original creation idempotency key is unaffected, exactly as
+-- with rescheduling.
+CREATE TABLE IF NOT EXISTS reservation_reassignments (
+    id                     BIGSERIAL PRIMARY KEY,
+    source_reservation_id  BIGINT NOT NULL
+                           REFERENCES reservations(id) ON DELETE CASCADE,
+    source_point_id        BIGINT NOT NULL,
+    target_point_id        BIGINT NOT NULL,
+    idempotency_key        TEXT NOT NULL,
+    expected_revision      INTEGER NOT NULL,        -- optimistic revision the client saw
+    new_reservation_id     BIGINT NOT NULL
+                           REFERENCES reservations(id) ON DELETE CASCADE,
+    start_utc              TIMESTAMPTZ NOT NULL,    -- window produced on the target point
+    end_utc                TIMESTAMPTZ NOT NULL,
+    rules_version          INTEGER NOT NULL,        -- target rules version validated against
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (source_reservation_id, idempotency_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_reservation_reassignments_source
+    ON reservation_reassignments (source_reservation_id);
+
+CREATE INDEX IF NOT EXISTS idx_reservation_reassignments_new
+    ON reservation_reassignments (new_reservation_id);
+
 -- Waitlist (候补) entries.  A visitor may only join the waitlist for a window
 -- that *would* be bookable under the current rules but is currently taken by an
 -- active (non-cancelled) reservation.  (point_id, idempotency_key) is the
